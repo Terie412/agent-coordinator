@@ -3,10 +3,34 @@ use crate::store::{MAX_WAIT, Scope, Store};
 use crate::{MAX_ITEMS, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 
 const PROTOCOLS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+const MAX_PENDING_WAITS: usize = 16;
+
+pub fn config(checkout: &Checkout, client: &str) -> Result<Value> {
+    let exe = std::env::current_exe()?;
+    let root = checkout
+        .root
+        .to_str()
+        .ok_or("Checkout path must be UTF-8")?;
+    let command = exe.to_str().ok_or("Executable path must be UTF-8")?;
+    let args = ["serve", root];
+    let local = || json!({"type":"local", "command":[command, "serve", root]});
+    match client {
+        "mcp" => Ok(json!({"mcpServers":{"agent_coordinator":{
+            "type":"stdio", "command":command, "args":args
+        }}})),
+        "opencode" => Ok(json!({"mcp":{"servers":{"agent_coordinator":local()}}})),
+        "opencode-v1" => Ok(json!({"mcp":{"agent_coordinator":{
+            "type":"local", "command":[command, "serve", root], "enabled":true, "timeout":30000
+        }}})),
+        "deepseek" => Ok(json!({"transport":"stdio", "command":command, "args":args})),
+        _ => Err("Config format must be codex, mcp, opencode, opencode-v1, or deepseek.".into()),
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,19 +52,59 @@ struct Release {
 
 pub fn serve(checkout: &Checkout) -> Result<()> {
     let mut store = Store::open(&checkout.database)?;
-    let mut output = io::stdout().lock();
-    for line in io::stdin().lock().lines() {
-        let message = serde_json::from_str::<Value>(&line?);
-        let reply = match message {
-            Ok(request) => dispatch(&mut store, checkout, request),
-            Err(_) => Some(error(Value::Null, -32700, "Parse error")),
-        };
-        if let Some(reply) = reply {
-            serde_json::to_writer(&mut output, &reply)?;
-            output.write_all(b"\n")?;
-            output.flush()?;
+    let pending = AtomicUsize::new(0);
+    thread::scope(|scope| -> Result<()> {
+        for line in io::stdin().lock().lines() {
+            let reply = match serde_json::from_str::<Value>(&line?) {
+                Ok(request) if waits_for_lock(&request) => {
+                    if pending.fetch_add(1, Ordering::Relaxed) >= MAX_PENDING_WAITS {
+                        pending.fetch_sub(1, Ordering::Relaxed);
+                        Some(tool_reply(
+                            request["id"].clone(),
+                            Err("Too many lock waits. Try again shortly.".into()),
+                        ))
+                    } else {
+                        // Other chats using the same connection must be able to release while this waits.
+                        let pending = &pending;
+                        scope.spawn(move || {
+                            let reply = match Store::open(&checkout.database) {
+                                Ok(mut store) => dispatch(&mut store, checkout, request),
+                                Err(error) => Some(tool_reply(request["id"].clone(), Err(error))),
+                            };
+                            if let Some(reply) = reply {
+                                let _ = write_reply(&reply);
+                            }
+                            pending.fetch_sub(1, Ordering::Relaxed);
+                        });
+                        None
+                    }
+                }
+                Ok(request) => dispatch(&mut store, checkout, request),
+                Err(_) => Some(error(Value::Null, -32700, "Parse error")),
+            };
+            if let Some(reply) = reply {
+                write_reply(&reply)?;
+            }
         }
-    }
+        Ok(())
+    })
+}
+
+fn waits_for_lock(request: &Value) -> bool {
+    request.get("id").is_some()
+        && request["jsonrpc"] == "2.0"
+        && request["method"] == "tools/call"
+        && request["params"]["name"] == "acquire"
+        && request["params"]["arguments"]["wait_seconds"]
+            .as_u64()
+            .is_some_and(|seconds| (1..=MAX_WAIT).contains(&seconds))
+}
+
+fn write_reply(reply: &Value) -> Result<()> {
+    let mut output = io::stdout().lock();
+    serde_json::to_writer(&mut output, reply)?;
+    output.write_all(b"\n")?;
+    output.flush()?;
     Ok(())
 }
 
@@ -67,7 +131,7 @@ fn dispatch(store: &mut Store, checkout: &Checkout, request: Value) -> Option<Va
                 "protocolVersion": version,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": env!("CARGO_PKG_NAME"), "title": "Agent Coordinator", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "Read freely. Acquire all affected checkout-relative file paths together before editing, with wait_seconds up to 15 on contention. Re-read after acquisition. Release after the commit or handoff. Git index operations require scope git, and operations changing the checkout require scope checkout. Commit only this session's files. The Codex hooks supply owner."
+                "instructions": "Acquire all affected checkout-relative paths together before writing. On contention wait up to 15 seconds per call, and re-read files once acquired. Release after commit or handoff. Scope git coordinates index and commit operations; scope checkout coordinates operations such as switching branches or merging. Commit only your own paths. With the Agent Coordinator Codex hooks enabled, omit owner. Otherwise call new_session once per chat and reuse its owner value on every acquire and release, including after reconnecting. Never share a chat owner with another chat."
             })
         }
         "ping" => json!({}),
@@ -77,39 +141,40 @@ fn dispatch(store: &mut Store, checkout: &Checkout, request: Value) -> Option<Va
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            match call(
+            let result = call(
                 store,
                 checkout,
                 params["name"].as_str().unwrap_or_default(),
                 args,
-            ) {
-                Ok(value) => {
-                    json!({"content": [{"type":"text", "text":value.to_string()}], "structuredContent":value})
-                }
-                Err(error) => {
-                    json!({"isError": true, "content": [{"type":"text", "text":error.to_string()}]})
-                }
-            }
+            );
+            return Some(tool_reply(id, result));
         }
         _ => return Some(error(id, -32601, "Method not found")),
     };
     Some(json!({"jsonrpc":"2.0", "id":id, "result":result}))
 }
 
+fn tool_reply(id: Value, result: Result<Value>) -> Value {
+    let payload = match result {
+        Ok(value) => {
+            json!({"content": [{"type":"text", "text":value.to_string()}], "structuredContent":value})
+        }
+        Err(error) => {
+            json!({"isError": true, "content": [{"type":"text", "text":error.to_string()}]})
+        }
+    };
+    json!({"jsonrpc":"2.0", "id":id, "result":payload})
+}
+
 fn call(store: &mut Store, checkout: &Checkout, name: &str, args: Value) -> Result<Value> {
     match name {
         "acquire" => {
             let args: Acquire = serde_json::from_value(args)?;
-            let paths = match (args.scope, args.paths) {
-                (Scope::Files, Some(paths)) => checkout.files(&paths, &checkout.root)?,
-                (Scope::Files, None) => return Err("paths is required for scope files".into()),
-                (_, Some(_)) => return Err("Only scope files accepts paths".into()),
-                (_, None) => BTreeMap::new(),
-            };
             store.acquire(
+                checkout,
                 args.owner.as_deref().unwrap_or_default(),
                 args.scope,
-                paths,
+                args.paths.as_deref(),
                 args.wait_seconds,
             )
         }
@@ -117,6 +182,10 @@ fn call(store: &mut Store, checkout: &Checkout, name: &str, args: Value) -> Resu
             store.status(&checkout.root)
         }
         "status" => Err("status does not take arguments".into()),
+        "new_session" if args.as_object().is_some_and(|args| args.is_empty()) => {
+            store.new_session()
+        }
+        "new_session" => Err("new_session does not take arguments".into()),
         "release" => {
             let args: Release = serde_json::from_value(args)?;
             store.release(args.owner.as_deref().unwrap_or_default(), &args.lock_ids)
@@ -126,8 +195,11 @@ fn call(store: &mut Store, checkout: &Checkout, name: &str, args: Value) -> Resu
 }
 
 fn tools() -> Value {
-    let owner = json!({"type":"string", "description":"Omit in Codex. Its hook supplies the actual session ID."});
+    let owner = json!({"type":"string", "description":"The owner returned by new_session for this chat. Omit only when the Agent Coordinator Codex hooks are enabled."});
     json!([
+        {"name":"new_session", "description":"Generate an owner ID for this chat. Use once per chat and reuse the ID for acquire and release, even after a reconnect.",
+            "inputSchema":{"type":"object","properties":{},"additionalProperties":false},
+            "annotations":{"readOnlyHint":true}},
         {"name":"acquire", "description":"Atomically claim a file group, Git index, or the whole checkout. On conflict no new locks are acquired. Re-read files after acquisition.",
             "inputSchema":{"type":"object", "additionalProperties":false, "properties":{
                 "owner":owner, "scope":{"type":"string","enum":["files","git","checkout"],"default":"files"},

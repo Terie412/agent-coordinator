@@ -5,20 +5,24 @@ mod store;
 
 use checkout::Checkout;
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
-use store::Store;
+use store::{Scope, Store};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const MAX_ITEMS: usize = 128;
 
-const USAGE: &str = "agent-coordinator <serve|hook|config|configure|status> <checkout>\nagent-coordinator recover <checkout> <owner> <lock-id> [<lock-id> ...]";
+const USAGE: &str = "agent-coordinator <serve|hook|configure|new-session|status> <checkout>
+agent-coordinator config <checkout> [codex|mcp|opencode|opencode-v1|deepseek]
+agent-coordinator acquire <checkout> <owner> [--wait <seconds>] [--scope files|git|checkout] [--] [<file> ...]
+agent-coordinator <release|recover> <checkout> <owner> <lock-id> [<lock-id> ...]
+
+acquire returns exit code 2 when another session blocks the request.";
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             eprintln!("agent-coordinator: {error}");
             ExitCode::FAILURE
@@ -26,7 +30,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<()> {
+fn run() -> Result<ExitCode> {
     let args: Vec<_> = env::args_os().skip(1).collect();
     let command = args
         .first()
@@ -34,25 +38,37 @@ fn run() -> Result<()> {
         .unwrap_or("--help");
     if matches!(command, "-h" | "--help") {
         println!("{USAGE}");
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     if command == "--version" {
         println!("agent-coordinator {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
-    if args.len() < 2 || (command != "recover" && args.len() != 2) {
+    let [_, directory, arguments @ ..] = args.as_slice() else {
         return Err(USAGE.into());
-    }
-    let checkout = Checkout::find(Path::new(&args[1]))?;
-    match command {
-        "serve" => mcp::serve(&checkout),
-        "hook" => codex::hook(&checkout),
-        "config" => {
-            print!("{}", codex::config(&checkout)?);
+    };
+    let checkout = Checkout::find(Path::new(directory))?;
+    match (command, arguments) {
+        ("serve", []) => mcp::serve(&checkout),
+        ("hook", []) => codex::hook(&checkout),
+        ("config", [] | [_]) => {
+            let client = arguments.first().map(utf8).transpose()?.unwrap_or("codex");
+            if client == "codex" {
+                print!("{}", codex::config(&checkout)?);
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&mcp::config(&checkout, client)?)?
+                );
+            }
             Ok(())
         }
-        "configure" => configure(&checkout),
-        "status" => {
+        ("configure", []) => codex::configure(&checkout),
+        ("new-session", []) => {
+            println!("{}", Store::open(&checkout.database)?.new_session()?);
+            Ok(())
+        }
+        ("status", []) => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(
@@ -61,42 +77,66 @@ fn run() -> Result<()> {
             );
             Ok(())
         }
-        "recover" if args.len() >= 4 => {
-            let owner = args[2].to_str().ok_or("Owner must be UTF-8")?;
-            let ids = args[3..]
+        ("acquire", [owner, options @ ..]) => {
+            return acquire(&checkout, utf8(owner)?, options);
+        }
+        ("release" | "recover", [owner, ids @ ..]) if !ids.is_empty() => {
+            let ids = ids
                 .iter()
-                .map(|arg| arg.to_str().unwrap_or_default().parse::<i64>())
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            println!("{}", Store::open(&checkout.database)?.release(owner, &ids)?);
+                .map(|arg| Ok(utf8(arg)?.parse::<i64>()?))
+                .collect::<Result<Vec<_>>>()?;
+            println!(
+                "{}",
+                Store::open(&checkout.database)?.release(utf8(owner)?, &ids)?
+            );
             Ok(())
         }
         _ => Err(USAGE.into()),
-    }
+    }?;
+    Ok(ExitCode::SUCCESS)
 }
 
-fn configure(checkout: &Checkout) -> Result<()> {
-    let directory = checkout.root.join(".codex");
-    fs::create_dir_all(&directory)?;
-    if dunce::canonicalize(&directory)? != directory {
-        return Err(
-            "The .codex directory resolves through an alias; use config for manual setup.".into(),
-        );
-    }
-    let path = directory.join("config.toml");
-    let config = codex::config(checkout)?;
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(mut file) => file.write_all(config.as_bytes())?,
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            if fs::read_to_string(&path)? != config {
-                return Err(format!(
-                    "{} already exists. Use config to print the configuration for merging.",
-                    path.display()
-                )
-                .into());
+fn acquire(checkout: &Checkout, owner: &str, mut arguments: &[OsString]) -> Result<ExitCode> {
+    let mut scope = Scope::Files;
+    let mut wait = 0;
+    while let [flag, rest @ ..] = arguments {
+        match utf8(flag)? {
+            "--" => {
+                arguments = rest;
+                break;
             }
+            "--wait" | "--scope" => {
+                let [value, tail @ ..] = rest else {
+                    return Err(format!("Missing value for {}", flag.to_string_lossy()).into());
+                };
+                if flag == "--wait" {
+                    wait = utf8(value)?.parse()?;
+                } else {
+                    scope = utf8(value)?.parse()?;
+                }
+                arguments = tail;
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("Unknown option: {option}").into());
+            }
+            _ => break,
         }
-        Err(error) => return Err(error.into()),
     }
-    println!("{}", path.display());
-    Ok(())
+    let files = arguments
+        .iter()
+        .map(|arg| Ok(utf8(arg)?.to_owned()))
+        .collect::<Result<Vec<_>>>()?;
+    let paths = (!files.is_empty()).then_some(files.as_slice());
+    let result = Store::open(&checkout.database)?.acquire(checkout, owner, scope, paths, wait)?;
+    println!("{result}");
+    Ok(if result["acquired"] == true {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
+fn utf8(arg: &OsString) -> Result<&str> {
+    arg.to_str()
+        .ok_or_else(|| "Expected a UTF-8 argument".into())
 }

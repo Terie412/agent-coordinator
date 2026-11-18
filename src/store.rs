@@ -1,9 +1,11 @@
+use crate::checkout::Checkout;
 use crate::{MAX_ITEMS, Result};
 use rusqlite::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::str::FromStr;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +26,19 @@ impl Scope {
             Self::Files => "files",
             Self::Git => "git",
             Self::Checkout => "checkout",
+        }
+    }
+}
+
+impl FromStr for Scope {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "files" => Ok(Self::Files),
+            "git" => Ok(Self::Git),
+            "checkout" => Ok(Self::Checkout),
+            _ => Err("Scope must be files, git, or checkout."),
         }
     }
 }
@@ -62,20 +77,33 @@ impl Store {
         Ok(Self(connection))
     }
 
+    pub fn new_session(&self) -> Result<Value> {
+        let owner: String = self.0.query_row(
+            "SELECT 'session-' || lower(hex(randomblob(16)))",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(json!({"owner": owner}))
+    }
+
     pub fn acquire(
         &mut self,
+        checkout: &Checkout,
         owner: &str,
         scope: Scope,
-        mut paths: BTreeMap<String, String>,
+        paths: Option<&[String]>,
         wait: u64,
     ) -> Result<Value> {
         validate_owner(owner)?;
         if wait > MAX_WAIT {
             return Err(format!("wait_seconds must be at most {MAX_WAIT}").into());
         }
-        if scope != Scope::Files {
-            paths.insert(String::new(), String::new());
-        }
+        let paths = match (scope, paths) {
+            (Scope::Files, Some(paths)) => checkout.files(paths, &checkout.root)?,
+            (Scope::Files, None) => return Err("paths is required for scope files".into()),
+            (_, Some(_)) => return Err("Only scope files accepts paths".into()),
+            (_, None) => BTreeMap::from([(String::new(), String::new())]),
+        };
         let deadline = Instant::now() + Duration::from_secs(wait);
         loop {
             let result = self.try_acquire(owner, scope, &paths)?;
@@ -248,7 +276,7 @@ fn timestamp() -> Result<i64> {
 pub fn validate_owner(owner: &str) -> Result<&str> {
     if owner.trim().is_empty() || owner.len() > 128 || owner.chars().any(char::is_control) {
         return Err(
-            "A session ID is required. In Codex, review and enable the Agent Coordinator hooks."
+            "Supply this chat's owner from new_session, or enable the Agent Coordinator hooks in Codex."
                 .into(),
         );
     }

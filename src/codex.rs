@@ -4,11 +4,39 @@ use crate::store::{Scope, Store, validate_owner};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::env;
-use std::io::{self, Read};
+use std::fs::{self, OpenOptions};
+use std::io::{self, ErrorKind, Read, Write};
 use std::path::Path;
 
 const PREFIX: &str = "mcp__agent_coordinator__";
 const MATCHER: &str = "^(apply_patch|Bash|mcp__agent_coordinator__(acquire|release))$";
+
+pub fn configure(checkout: &Checkout) -> Result<()> {
+    let directory = checkout.root.join(".codex");
+    fs::create_dir_all(&directory)?;
+    if dunce::canonicalize(&directory)? != directory {
+        return Err(
+            "The .codex directory resolves through an alias; use config for manual setup.".into(),
+        );
+    }
+    let path = directory.join("config.toml");
+    let config = config(checkout)?;
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => file.write_all(config.as_bytes())?,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            if fs::read_to_string(&path)? != config {
+                return Err(format!(
+                    "{} already exists. Use config to print the configuration for merging.",
+                    path.display()
+                )
+                .into());
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    println!("{}", path.display());
+    Ok(())
+}
 
 pub fn config(checkout: &Checkout) -> Result<String> {
     let exe = env::current_exe()?;

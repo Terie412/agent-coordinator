@@ -77,12 +77,17 @@ impl Client {
         self.next_id += 1;
     }
 
-    fn receive(&mut self) -> Value {
+    fn receive_reply(&mut self) -> Value {
         let mut line = String::new();
         self.output.read_line(&mut line).unwrap();
         let value: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(value["id"], self.next_id - 1);
         assert!(value["error"].is_null(), "{value}");
+        value
+    }
+
+    fn receive(&mut self) -> Value {
+        let value = self.receive_reply();
+        assert_eq!(value["id"], self.next_id - 1);
         value["result"].clone()
     }
 
@@ -111,7 +116,7 @@ fn independent_processes_wait_and_acquire_as_a_group() {
     let mut first = Client::start(&root);
     let mut second = Client::start(&root);
     first.send("tools/list", json!({}));
-    assert_eq!(first.receive()["tools"].as_array().unwrap().len(), 3);
+    assert_eq!(first.receive()["tools"].as_array().unwrap().len(), 4);
 
     first.send_tool(
         "acquire",
@@ -164,6 +169,63 @@ fn independent_processes_wait_and_acquire_as_a_group() {
         holder.tool("release", json!({"owner":hold_id, "lock_ids":[id]}))["already_absent"],
         json!([id])
     );
+}
+
+#[test]
+fn terminal_and_mcp_chats_share_locks_even_over_a_shared_connection() {
+    let root = repo();
+    let run = |command: &str, args: &[&str]| {
+        let output = Command::new(EXE)
+            .arg(command)
+            .arg(&root)
+            .args(args)
+            .output()
+            .unwrap();
+        let payload: Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|_| panic!("{output:?}"));
+        (output.status.code().unwrap(), payload)
+    };
+    let (code, terminal) = run("new-session", &[]);
+    assert_eq!(code, 0);
+    let owner = terminal["owner"].as_str().unwrap();
+    let mut mcp = Client::start(&root);
+    let first = mcp.tool("new_session", json!({}))["owner"].clone();
+    let second = mcp.tool("new_session", json!({}))["owner"].clone();
+    assert_ne!(first, second);
+    assert_ne!(first, terminal["owner"]);
+    mcp.send_tool("acquire", json!({"paths":["shared path.txt"]}));
+    assert_eq!(mcp.receive()["isError"], true);
+
+    let (code, grant) = run("acquire", &[owner, "--", "shared path.txt", "-other.txt"]);
+    assert_eq!(code, 0);
+    let id = grant["locks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|lock| lock["path"] == "shared path.txt")
+        .unwrap()["lock_id"]
+        .clone();
+    let (code, conflict) = run("acquire", &[first.as_str().unwrap(), "shared path.txt"]);
+    assert_eq!(code, 2);
+    assert_eq!(conflict["conflicts"][0]["owner"], owner);
+    let held = mcp.tool("status", json!({}));
+    assert_eq!(held["locks"].as_array().unwrap().len(), 2);
+
+    let wait_id = mcp.next_id;
+    mcp.send_tool(
+        "acquire",
+        json!({"owner":second, "paths":["shared path.txt"], "wait_seconds":3}),
+    );
+    mcp.send_tool("release", json!({"owner":owner, "lock_ids":[id]}));
+    let replies = [mcp.receive_reply(), mcp.receive_reply()];
+    let acquired = replies.iter().find(|reply| reply["id"] == wait_id).unwrap();
+    assert_eq!(acquired["result"]["structuredContent"]["acquired"], true);
+
+    let id = acquired["result"]["structuredContent"]["locks"][0]["lock_id"].to_string();
+    drop(mcp);
+    let (code, released) = run("release", &[second.as_str().unwrap(), &id]);
+    assert_eq!(code, 0);
+    assert_eq!(released["released"].as_array().unwrap().len(), 1);
 }
 
 fn hook(root: &Path, event: &str, owner: &str, tool: &str, input: Value) -> Value {
