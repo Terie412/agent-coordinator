@@ -1,0 +1,313 @@
+use serde_json::{Value, json};
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const EXE: &str = env!("CARGO_BIN_EXE_agent-coordinator");
+static NEXT: AtomicU32 = AtomicU32::new(0);
+
+fn repo() -> PathBuf {
+    let id = format!(
+        "checkout {}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/test-repos")
+        .join(id);
+    fs::create_dir_all(&root).unwrap();
+    let output = Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    root
+}
+
+struct Client {
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
+    next_id: i64,
+}
+
+impl Client {
+    fn start(root: &Path) -> Self {
+        let mut child = Command::new(EXE)
+            .arg("serve")
+            .arg(root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = BufReader::new(child.stdout.take().unwrap());
+        let mut client = Self {
+            child,
+            input,
+            output,
+            next_id: 1,
+        };
+        client.send("initialize", json!({"protocolVersion":"2025-11-25", "capabilities":{}, "clientInfo":{"name":"fixture", "version":"1"}}));
+        assert_eq!(client.receive()["protocolVersion"], "2025-11-25");
+        writeln!(
+            client.input,
+            "{}",
+            json!({"jsonrpc":"2.0", "method":"notifications/initialized"})
+        )
+        .unwrap();
+        client
+    }
+
+    fn send(&mut self, method: &str, params: Value) {
+        writeln!(
+            self.input,
+            "{}",
+            json!({"jsonrpc":"2.0", "id": self.next_id, "method":method, "params":params})
+        )
+        .unwrap();
+        self.next_id += 1;
+    }
+
+    fn receive(&mut self) -> Value {
+        let mut line = String::new();
+        self.output.read_line(&mut line).unwrap();
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["id"], self.next_id - 1);
+        assert!(value["error"].is_null(), "{value}");
+        value["result"].clone()
+    }
+
+    fn send_tool(&mut self, name: &str, arguments: Value) {
+        self.send("tools/call", json!({"name":name, "arguments":arguments}));
+    }
+
+    fn tool(&mut self, name: &str, arguments: Value) -> Value {
+        self.send_tool(name, arguments);
+        let response = self.receive();
+        assert_ne!(response["isError"], true, "{response}");
+        response["structuredContent"].clone()
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn independent_processes_wait_and_acquire_as_a_group() {
+    let root = repo();
+    let mut first = Client::start(&root);
+    let mut second = Client::start(&root);
+    first.send("tools/list", json!({}));
+    assert_eq!(first.receive()["tools"].as_array().unwrap().len(), 3);
+
+    first.send_tool(
+        "acquire",
+        json!({"owner":"first", "paths":["shared.txt", "first.txt"]}),
+    );
+    second.send_tool(
+        "acquire",
+        json!({"owner":"second", "paths":["./shared.txt", "second.txt"]}),
+    );
+    let a = first.receive()["structuredContent"].clone();
+    let b = second.receive()["structuredContent"].clone();
+    assert_ne!(a["acquired"], b["acquired"]);
+    let (holder, waiter, held, hold_id, wait_id, untouched) = if a["acquired"] == true {
+        (&mut first, &mut second, a, "first", "second", "second.txt")
+    } else {
+        (&mut second, &mut first, b, "second", "first", "first.txt")
+    };
+    let state = waiter.tool("status", json!({}));
+    assert_eq!(state["locks"].as_array().unwrap().len(), 2);
+    assert!(
+        state["locks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|lock| lock["owner"] == hold_id)
+    );
+    assert_eq!(
+        waiter.tool("acquire", json!({"owner":wait_id, "paths":[untouched]}))["acquired"],
+        true
+    );
+
+    let id = held["locks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|lock| lock["path"] == "shared.txt")
+        .unwrap()["lock_id"]
+        .clone();
+    waiter.send_tool(
+        "acquire",
+        json!({"owner":wait_id, "paths":["shared.txt"], "wait_seconds":3}),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    assert_eq!(
+        holder.tool("release", json!({"owner":hold_id, "lock_ids":[id]}))["released"],
+        json!([id])
+    );
+    assert_eq!(waiter.receive()["structuredContent"]["acquired"], true);
+    assert_eq!(
+        holder.tool("release", json!({"owner":hold_id, "lock_ids":[id]}))["already_absent"],
+        json!([id])
+    );
+}
+
+fn hook(root: &Path, event: &str, owner: &str, tool: &str, input: Value) -> Value {
+    let mut child = Command::new(EXE)
+        .arg("hook")
+        .arg(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.take().unwrap(),
+        "{}",
+        json!({"cwd":root,
+        "hook_event_name":event, "session_id":owner, "tool_name":tool, "tool_input":input})
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    if output.stdout.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["hookSpecificOutput"].clone()
+    }
+}
+
+#[test]
+fn hook_checks_rename_paths_and_identity_and_preserves_ended_locks() {
+    let root = repo();
+    fs::write(root.join("old.txt"), "old\n").unwrap();
+    let mut client = Client::start(&root);
+    let command =
+        "*** Begin Patch\n*** Update File: old.txt\n*** Move to: 新文件.txt\n*** End Patch";
+    let check = |owner| {
+        hook(
+            &root,
+            "PreToolUse",
+            owner,
+            "apply_patch",
+            json!({"command":command}),
+        )
+    };
+    assert_eq!(check("session-a")["permissionDecision"], "deny");
+
+    let request = hook(
+        &root,
+        "PreToolUse",
+        "session-a",
+        "mcp__agent_coordinator__acquire",
+        json!({"owner":"other", "paths":["old.txt"]}),
+    );
+    assert_eq!(request["updatedInput"]["owner"], "session-a");
+    let grant = client.tool("acquire", request["updatedInput"].clone());
+    assert_eq!(check("session-a")["permissionDecision"], "deny");
+    client.tool(
+        "acquire",
+        json!({"owner":"session-a", "paths":["新文件.txt"]}),
+    );
+    assert!(check("session-a").is_null());
+    assert_eq!(check("session-b")["permissionDecision"], "deny");
+
+    drop(client);
+    hook(&root, "SessionEnd", "session-a", "", json!({}));
+    let mut client = Client::start(&root);
+    let denied = client.tool("acquire", json!({"owner":"session-b", "paths":["old.txt"]}));
+    assert!(denied["conflicts"][0]["ended_at"].is_u64());
+    assert_eq!(check("session-a")["permissionDecision"], "deny");
+    let resumed = client.tool("acquire", request["updatedInput"].clone());
+    assert_ne!(resumed["locks"][0]["lock_id"], grant["locks"][0]["lock_id"]);
+    let stale = grant["locks"][0]["lock_id"].as_i64().unwrap().to_string();
+    let result = Command::new(EXE)
+        .arg("recover")
+        .arg(&root)
+        .args(["session-a", &stale])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert_eq!(
+        client.tool("status", json!({}))["locks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn git_lock_serializes_index_operations_and_checkout_lock_excludes_other_owners() {
+    let root = repo();
+    let mut one = Client::start(&root);
+    let mut two = Client::start(&root);
+    let git = |owner, command| {
+        hook(
+            &root,
+            "PreToolUse",
+            owner,
+            "Bash",
+            json!({"command":command}),
+        )
+    };
+    assert!(git("one", "git status --short").is_null());
+    assert_eq!(
+        git("one", "git commit --only -- a")["permissionDecision"],
+        "deny"
+    );
+    assert_eq!(
+        one.tool("acquire", json!({"owner":"one", "scope":"git"}))["acquired"],
+        true
+    );
+    assert!(git("one", "git commit --only -- a").is_null());
+    assert_eq!(
+        two.tool("acquire", json!({"owner":"two", "scope":"git"}))["acquired"],
+        false
+    );
+    assert_eq!(
+        two.tool("acquire", json!({"owner":"two", "paths":["a"]}))["acquired"],
+        true
+    );
+    assert_eq!(
+        one.tool("acquire", json!({"owner":"one", "scope":"checkout"}))["acquired"],
+        false
+    );
+    assert_eq!(git("one", "git switch main")["permissionDecision"], "deny");
+    if cfg!(windows) {
+        assert_eq!(
+            one.tool("acquire", json!({"owner":"one", "paths":["A"]}))["acquired"],
+            false
+        );
+    }
+    let id = two.tool("status", json!({}))["locks"][1]["lock_id"].clone();
+    let wrong = one.tool("status", json!({}))["locks"][0]["lock_id"].clone();
+    two.send_tool("release", json!({"owner":"two", "lock_ids":[id, wrong]}));
+    assert_eq!(two.receive()["isError"], true);
+    assert_eq!(
+        two.tool("release", json!({"owner":"two", "lock_ids":[id]}))["released"],
+        json!([id])
+    );
+    assert_eq!(
+        one.tool("acquire", json!({"owner":"one", "scope":"checkout"}))["acquired"],
+        true
+    );
+    assert!(git("one", "git switch main").is_null());
+    assert_eq!(
+        two.tool("acquire", json!({"owner":"two", "paths":["a"]}))["acquired"],
+        false
+    );
+}
