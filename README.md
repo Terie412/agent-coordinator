@@ -4,15 +4,23 @@
 
 ## 安装
 
-需要 Git 和 Rust 1.88+。下方是 Windows 示例，编译需要 Visual Studio C++ Build Tools。
+从 [GitHub Releases](https://github.com/Terie412/agent-coordinator/releases/latest) 下载对应系统的压缩包，解压到固定目录即可使用。
+
+| 系统 | 下载包 |
+| --- | --- |
+| Windows x64 | [下载 ZIP](https://github.com/Terie412/agent-coordinator/releases/latest/download/agent-coordinator-windows-x64.zip) |
+| macOS Apple 芯片 | [下载 TAR.GZ](https://github.com/Terie412/agent-coordinator/releases/latest/download/agent-coordinator-macos-arm64.tar.gz) |
+| macOS Intel 芯片 | [下载 TAR.GZ](https://github.com/Terie412/agent-coordinator/releases/latest/download/agent-coordinator-macos-x64.tar.gz) |
+| Linux x64 | [下载 TAR.GZ](https://github.com/Terie412/agent-coordinator/releases/latest/download/agent-coordinator-linux-x64.tar.gz) |
+
+在解压目录打开 PowerShell，将 `$repo` 设为要共用的 Git 工作目录。
 
 ```powershell
-git clone https://github.com/Terie412/agent-coordinator.git
-cd agent-coordinator
-cargo build --release --locked
-$coordinator = (Resolve-Path '.\target\release\agent-coordinator.exe').Path
+$coordinator = (Resolve-Path '.\agent-coordinator.exe').Path
 $repo = 'C:\path\to\your-repo'
 ```
+
+macOS 和 Linux 用解压后的 `./agent-coordinator` 执行下方命令，例如 `./agent-coordinator configure '/path/to/your-repo'`。
 
 ## 接入 Agent
 

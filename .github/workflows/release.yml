@@ -1,0 +1,115 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.package }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: windows-x64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - package: linux-x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+          - package: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - package: macos-x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+    env:
+      RUST_TOOLCHAIN: '1.88.0'
+      RUST_TARGET: ${{ matrix.target }}
+      PACKAGE: ${{ matrix.package }}
+      ARCHIVE_FORMAT: ${{ matrix.archive }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Linux static build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo 'CC_x86_64_unknown_linux_musl=musl-gcc' >> "$GITHUB_ENV"
+          echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV"
+      - name: Build and test
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --target $env:RUST_TARGET
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $toolchain = "+$env:RUST_TOOLCHAIN"
+          $metadata = cargo $toolchain metadata --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = ($metadata | ConvertFrom-Json).packages[0].version
+          if ($env:GITHUB_REF_NAME -cne "v$version") { throw 'The tag must match Cargo.toml.' }
+
+          cargo $toolchain test --release --locked --target $env:RUST_TARGET
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo $toolchain build --release --locked --target $env:RUST_TARGET
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package and smoke-test the download
+        shell: pwsh
+        run: |
+          $binary = if ($IsWindows) { 'agent-coordinator.exe' } else { 'agent-coordinator' }
+          $releaseDir = "target/$env:RUST_TARGET/release"
+          New-Item -ItemType Directory -Path dist, package-check | Out-Null
+          $archive = "dist/agent-coordinator-$env:PACKAGE.$env:ARCHIVE_FORMAT"
+          if ($IsWindows) {
+            Compress-Archive -LiteralPath "$releaseDir/$binary" -DestinationPath $archive
+            Expand-Archive -LiteralPath $archive -DestinationPath package-check
+          } else {
+            tar -czf $archive -C $releaseDir $binary
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            tar -xzf $archive -C package-check
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $version = & "./package-check/$binary" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($version -cne "agent-coordinator $($env:GITHUB_REF_NAME.Substring(1))") {
+            throw "Unexpected version in packaged binary: $version"
+          }
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.package }}
+          path: dist/agent-coordinator-*
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/agent-coordinator-windows-x64.zip \
+            dist/agent-coordinator-linux-x64.tar.gz \
+            dist/agent-coordinator-macos-arm64.tar.gz \
+            dist/agent-coordinator-macos-x64.tar.gz \
+            --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "Agent Coordinator $GITHUB_REF_NAME" \
+            --notes '下载适合你电脑的压缩包，解压后按 README 接入你的 Agent。'
