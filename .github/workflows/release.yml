@@ -3,13 +3,26 @@ name: Release
 on:
   push:
     tags: ['v*']
+    branches: ['release/v*']
 
 permissions:
   contents: read
 
 jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.value }}
+    steps:
+      - name: Select the release tag
+        id: tag
+        run: |
+          tag="${GITHUB_REF_NAME#release/}"
+          printf 'value=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.package }}
+    needs: version
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -36,10 +49,12 @@ jobs:
       RUST_TARGET: ${{ matrix.target }}
       PACKAGE: ${{ matrix.package }}
       ARCHIVE_FORMAT: ${{ matrix.archive }}
+      RELEASE_TAG: ${{ needs.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          ref: refs/tags/${{ env.RELEASE_TAG }}
       - name: Install Linux static build tools
         if: runner.os == 'Linux'
         run: |
@@ -56,7 +71,7 @@ jobs:
           $metadata = cargo $toolchain metadata --locked --no-deps --format-version 1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $version = ($metadata | ConvertFrom-Json).packages[0].version
-          if ($env:GITHUB_REF_NAME -cne "v$version") { throw 'The tag must match Cargo.toml.' }
+          if ($env:RELEASE_TAG -cne "v$version") { throw 'The tag must match Cargo.toml.' }
 
           cargo $toolchain test --release --locked --target $env:RUST_TARGET
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -80,7 +95,7 @@ jobs:
           }
           $version = & "./package-check/$binary" --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if ($version -cne "agent-coordinator $($env:GITHUB_REF_NAME.Substring(1))") {
+          if ($version -cne "agent-coordinator $($env:RELEASE_TAG.Substring(1))") {
             throw "Unexpected version in packaged binary: $version"
           }
       - uses: actions/upload-artifact@v6
@@ -92,7 +107,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -104,12 +119,13 @@ jobs:
       - name: Publish packages
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$RELEASE_TAG" \
             dist/agent-coordinator-windows-x64.zip \
             dist/agent-coordinator-linux-x64.tar.gz \
             dist/agent-coordinator-macos-arm64.tar.gz \
             dist/agent-coordinator-macos-x64.tar.gz \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "Agent Coordinator $GITHUB_REF_NAME" \
+            --title "Agent Coordinator $RELEASE_TAG" \
             --notes '下载适合你电脑的压缩包，解压后按 README 接入你的 Agent。'
