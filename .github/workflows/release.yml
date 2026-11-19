@@ -82,18 +82,37 @@ jobs:
         run: |
           $binary = if ($IsWindows) { 'agent-coordinator.exe' } else { 'agent-coordinator' }
           $releaseDir = "target/$env:RUST_TARGET/release"
-          New-Item -ItemType Directory -Path dist, package-check | Out-Null
-          $archive = "dist/agent-coordinator-$env:PACKAGE.$env:ARCHIVE_FORMAT"
+          $pluginDir = 'target/plugin-package/plugins/agent-coordinator'
+          Copy-Item -LiteralPath codex-plugin -Destination 'target/plugin-package' -Recurse -Force
+          New-Item -ItemType Directory -Force -Path dist, 'target/package-check', "$pluginDir/bin" | Out-Null
+          Copy-Item -LiteralPath "$releaseDir/$binary" -Destination "$pluginDir/bin/$binary"
           if ($IsWindows) {
-            Compress-Archive -LiteralPath "$releaseDir/$binary" -DestinationPath $archive
-            Expand-Archive -LiteralPath $archive -DestinationPath package-check
+            $mcp = Get-Content -Raw -LiteralPath "$pluginDir/.mcp.json" | ConvertFrom-Json
+            $mcp.mcpServers.agent_coordinator.command = './bin/agent-coordinator.exe'
+            $mcp | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "$pluginDir/.mcp.json" -Encoding utf8
           } else {
-            tar -czf $archive -C $releaseDir $binary
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            tar -xzf $archive -C package-check
+            chmod +x "$pluginDir/bin/$binary"
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
-          $version = & "./package-check/$binary" --version
+          $archive = "dist/agent-coordinator-$env:PACKAGE.$env:ARCHIVE_FORMAT"
+          if ($IsWindows) {
+            tar -a -cf $archive -C target/plugin-package .
+          } else {
+            tar -czf $archive -C target/plugin-package .
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $unpacked = 'target/package-check'
+          tar -xf $archive -C $unpacked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $marketplace = Get-Content -Raw -LiteralPath "$unpacked/.agents/plugins/marketplace.json" | ConvertFrom-Json
+          $plugin = "$unpacked/$($marketplace.plugins[0].source.path)"
+          $manifest = Get-Content -Raw -LiteralPath "$plugin/.codex-plugin/plugin.json" | ConvertFrom-Json
+          if ("v$($manifest.version)" -cne $env:RELEASE_TAG) { throw 'The plugin manifest version must match the tag.' }
+          if (!(Test-Path -LiteralPath "$plugin/$($manifest.hooks)" -PathType Leaf)) {
+            throw 'The archive is missing the plugin hooks.'
+          }
+          $mcp = Get-Content -Raw -LiteralPath "$plugin/$($manifest.mcpServers)" | ConvertFrom-Json
+          $version = & "./$plugin/$($mcp.mcpServers.agent_coordinator.command)" --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($version -cne "agent-coordinator $($env:RELEASE_TAG.Substring(1))") {
             throw "Unexpected version in packaged binary: $version"
@@ -128,4 +147,4 @@ jobs:
             dist/agent-coordinator-macos-x64.tar.gz \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "Agent Coordinator $RELEASE_TAG" \
-            --notes '下载适合你电脑的压缩包，解压后按 README 接入你的 Agent。'
+            --notes '下载适合你电脑的压缩包，解压后按 README 安装 Codex 插件。'

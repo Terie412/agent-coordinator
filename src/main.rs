@@ -13,12 +13,10 @@ use store::{Scope, Store};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const MAX_ITEMS: usize = 128;
 
-const USAGE: &str = "agent-coordinator <serve|hook|configure|new-session|status> <checkout>
-agent-coordinator config <checkout> [codex|mcp|opencode|opencode-v1|deepseek]
-agent-coordinator acquire <checkout> <owner> [--wait <seconds>] [--scope files|git|checkout] [--] [<file> ...]
-agent-coordinator <release|recover> <checkout> <owner> <lock-id> [<lock-id> ...]
+const USAGE: &str = "Agent Coordinator for Codex
 
-acquire returns exit code 2 when another session blocks the request.";
+agent-coordinator status <checkout>
+agent-coordinator recover <checkout> <owner> <lock-id> [<lock-id> ...]";
 
 fn main() -> ExitCode {
     match run() {
@@ -44,23 +42,23 @@ fn run() -> Result<ExitCode> {
         println!("agent-coordinator {}", env!("CARGO_PKG_VERSION"));
         return Ok(ExitCode::SUCCESS);
     }
+    if args.len() == 1 {
+        match command {
+            "serve" => mcp::serve(None)?,
+            "hook" => codex::hook(None)?,
+            _ => return Err(USAGE.into()),
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let [_, directory, arguments @ ..] = args.as_slice() else {
         return Err(USAGE.into());
     };
     let checkout = Checkout::find(Path::new(directory))?;
     match (command, arguments) {
-        ("serve", []) => mcp::serve(&checkout),
-        ("hook", []) => codex::hook(&checkout),
-        ("config", [] | [_]) => {
-            let client = arguments.first().map(utf8).transpose()?.unwrap_or("codex");
-            if client == "codex" {
-                print!("{}", codex::config(&checkout)?);
-            } else {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&mcp::config(&checkout, client)?)?
-                );
-            }
+        ("serve", []) => mcp::serve(Some(&checkout)),
+        ("hook", []) => codex::hook(Some(&checkout)),
+        ("config", []) => {
+            print!("{}", codex::config(&checkout)?);
             Ok(())
         }
         ("configure", []) => codex::configure(&checkout),

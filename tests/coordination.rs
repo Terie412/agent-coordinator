@@ -41,9 +41,13 @@ struct Client {
 
 impl Client {
     fn start(root: &Path) -> Self {
+        Self::connect(&[root])
+    }
+
+    fn connect(roots: &[&Path]) -> Self {
         let mut child = Command::new(EXE)
             .arg("serve")
-            .arg(root)
+            .args(roots)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -229,9 +233,20 @@ fn terminal_and_mcp_chats_share_locks_even_over_a_shared_connection() {
 }
 
 fn hook(root: &Path, event: &str, owner: &str, tool: &str, input: Value) -> Value {
+    run_hook(root, &[root], event, owner, tool, input)
+}
+
+fn run_hook(
+    root: &Path,
+    scope: &[&Path],
+    event: &str,
+    owner: &str,
+    tool: &str,
+    input: Value,
+) -> Value {
     let mut child = Command::new(EXE)
         .arg("hook")
-        .arg(root)
+        .args(scope)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -250,6 +265,61 @@ fn hook(root: &Path, event: &str, owner: &str, tool: &str, input: Value) -> Valu
     } else {
         serde_json::from_slice::<Value>(&output.stdout).unwrap()["hookSpecificOutput"].clone()
     }
+}
+
+#[test]
+fn plugin_uses_codex_context_to_route_locks_to_the_correct_checkout() {
+    let first = repo();
+    let second = repo();
+    let subfolder = first.join("src");
+    fs::create_dir(&subfolder).unwrap();
+    let mut mcp = Client::connect(&[]);
+    mcp.send("tools/list", json!({}));
+    assert_eq!(mcp.receive()["tools"].as_array().unwrap().len(), 3);
+    mcp.send_tool("status", json!({}));
+    assert_eq!(mcp.receive()["isError"], true);
+
+    let route = |cwd: &Path, tool: &str, args: Value| {
+        let name = format!("mcp__agent_coordinator__{tool}");
+        run_hook(cwd, &[], "PreToolUse", "session", &name, args)["updatedInput"].clone()
+    };
+    let args = route(
+        &subfolder,
+        "acquire",
+        json!({"owner":"wrong", "checkout":second, "paths":["src/shared.txt"]}),
+    );
+    assert_eq!(args["owner"], "session");
+    let granted = mcp.tool("acquire", args);
+    assert_eq!(granted["acquired"], true);
+    assert_eq!(
+        mcp.tool("status", route(&first, "status", json!({})))["locks"],
+        granted["locks"]
+    );
+    assert_eq!(
+        mcp.tool("status", route(&second, "status", json!({})))["locks"],
+        json!([])
+    );
+
+    let patch =
+        json!({"command":"*** Begin Patch\n*** Add File: shared.txt\n+hello\n*** End Patch"});
+    assert!(
+        run_hook(
+            &subfolder,
+            &[],
+            "PreToolUse",
+            "session",
+            "apply_patch",
+            patch.clone()
+        )
+        .is_null()
+    );
+    assert_eq!(
+        run_hook(&second, &[], "PreToolUse", "session", "apply_patch", patch)["permissionDecision"],
+        "deny"
+    );
+    let ids = json!({"lock_ids":[granted["locks"][0]["lock_id"]]});
+    let released = mcp.tool("release", route(&subfolder, "release", ids));
+    assert_eq!(released["released"].as_array().unwrap().len(), 1);
 }
 
 #[test]

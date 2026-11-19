@@ -1,0 +1,42 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/agent-coordinator\" hook",
+            "commandWindows": "& \"$env:PLUGIN_ROOT/bin/agent-coordinator.exe\" hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^(apply_patch|Bash|mcp__agent_coordinator__(acquire|status|release))$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/agent-coordinator\" hook",
+            "commandWindows": "& \"$env:PLUGIN_ROOT/bin/agent-coordinator.exe\" hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/agent-coordinator\" hook",
+            "commandWindows": "& \"$env:PLUGIN_ROOT/bin/agent-coordinator.exe\" hook",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

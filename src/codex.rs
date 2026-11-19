@@ -88,27 +88,15 @@ timeout = 3
     ))
 }
 
-pub fn hook(checkout: &Checkout) -> Result<()> {
+pub fn hook(fixed: Option<&Checkout>) -> Result<()> {
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input)?;
     let input: Value = serde_json::from_slice(&input)?;
     let event = input["hook_event_name"].as_str().unwrap_or_default();
-    let result = match event {
-        "SessionStart" => Some(json!({"hookSpecificOutput": {
-            "hookEventName": event,
-            "additionalContext": "This checkout uses agent_coordinator. Call acquire with all checkout-relative paths before writing (including shell/script writes) and release exact IDs only after commit or explicit handoff. If blocked, use a bounded wait and re-read after acquiring. Use scope git for index/commit operations and scope checkout for branch switches, merges, and rebases. Commit only the paths you locked. Never release during an in-flight write."
-        }})),
-        "SessionEnd" => {
-            if checkout.database.exists() {
-                Store::open(&checkout.database)?.mark_ended(session(&input)?)?;
-            }
-            None
-        }
-        "PreToolUse" => match pre_tool_use(checkout, &input) {
-            Ok(result) => result,
-            Err(error) => Some(deny(error.to_string())),
-        },
-        _ => None,
+    let result = match hook_result(fixed, &input, event) {
+        Ok(result) => result,
+        Err(error) if event == "PreToolUse" => Some(deny(error.to_string())),
+        Err(error) => return Err(error),
     };
     if let Some(result) = result {
         println!("{result}");
@@ -116,19 +104,55 @@ pub fn hook(checkout: &Checkout) -> Result<()> {
     Ok(())
 }
 
+fn hook_result(fixed: Option<&Checkout>, input: &Value, event: &str) -> Result<Option<Value>> {
+    let local;
+    let checkout = if let Some(checkout) = fixed {
+        checkout
+    } else {
+        let cwd = input["cwd"]
+            .as_str()
+            .ok_or("Missing Codex working directory")?;
+        local = Checkout::locate(Path::new(cwd))?;
+        let Some(checkout) = local.as_ref() else {
+            return Ok(None);
+        };
+        checkout
+    };
+    Ok(match event {
+        "SessionStart" => Some(json!({"hookSpecificOutput": {
+            "hookEventName": event,
+            "additionalContext": "This checkout uses agent_coordinator. Call acquire with all checkout-relative paths before writing (including shell/script writes) and release exact IDs only after commit or explicit handoff. If blocked, use a bounded wait and re-read after acquiring. Use scope git for index/commit operations and scope checkout for branch switches, merges, and rebases. Commit only the paths you locked. Never release during an in-flight write."
+        }})),
+        "SessionEnd" => {
+            if checkout.database.exists() {
+                Store::open(&checkout.database)?.mark_ended(session(input)?)?;
+            }
+            None
+        }
+        "PreToolUse" => pre_tool_use(checkout, input, fixed.is_none())?,
+        _ => None,
+    })
+}
+
 fn session(input: &Value) -> Result<&str> {
     validate_owner(input["session_id"].as_str().unwrap_or_default())
 }
 
-fn pre_tool_use(checkout: &Checkout, input: &Value) -> Result<Option<Value>> {
+fn pre_tool_use(checkout: &Checkout, input: &Value, plugin: bool) -> Result<Option<Value>> {
     let tool = input["tool_name"].as_str().ok_or("Missing tool_name")?;
     let arguments = &input["tool_input"];
-    if matches!(tool.strip_prefix(PREFIX), Some("acquire" | "release")) {
+    let action = tool.strip_prefix(PREFIX);
+    if matches!(action, Some("acquire" | "release")) || plugin && action == Some("status") {
         let mut updated = arguments
             .as_object()
             .ok_or("Missing MCP arguments")?
             .clone();
-        updated.insert("owner".into(), json!(session(input)?));
+        if action != Some("status") {
+            updated.insert("owner".into(), json!(session(input)?));
+        }
+        if plugin {
+            updated.insert("checkout".into(), json!(checkout.root));
+        }
         return Ok(Some(json!({"hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "allow", "updatedInput": updated
         }})));

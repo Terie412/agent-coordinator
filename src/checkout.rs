@@ -11,6 +11,11 @@ pub struct Checkout {
 
 impl Checkout {
     pub fn find(directory: &Path) -> Result<Self> {
+        Self::locate(directory)?
+            .ok_or_else(|| format!("No Git checkout at {}", directory.display()).into())
+    }
+
+    pub fn locate(directory: &Path) -> Result<Option<Self>> {
         let directory = dunce::canonicalize(directory)?;
         for root in directory.ancestors() {
             let marker = root.join(".git");
@@ -29,13 +34,13 @@ impl Checkout {
             if !git_dir.join("HEAD").is_file() {
                 return Err(format!("Missing Git metadata in {}", git_dir.display()).into());
             }
-            return Ok(Self {
+            return Ok(Some(Self {
                 root: root.to_owned(),
                 // Use the existing database so a rename preserves active locks and lock IDs.
                 database: git_dir.join("codex-checkout-lock.sqlite3"),
-            });
+            }));
         }
-        Err(format!("No Git checkout at {}", directory.display()).into())
+        Ok(None)
     }
 
     pub fn files(&self, files: &[String], from: &Path) -> Result<BTreeMap<String, String>> {

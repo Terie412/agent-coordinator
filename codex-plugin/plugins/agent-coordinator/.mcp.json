@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "agent_coordinator": {
+      "type": "stdio",
+      "command": "./bin/agent-coordinator",
+      "args": ["serve"],
+      "cwd": ".",
+      "tool_timeout_sec": 30
+    }
+  }
+}

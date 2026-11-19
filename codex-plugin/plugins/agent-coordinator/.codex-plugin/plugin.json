@@ -1,0 +1,13 @@
+{
+  "name": "agent-coordinator",
+  "version": "0.2.0",
+  "description": "Coordinate file edits and Git operations across local Codex chats.",
+  "repository": "https://github.com/Terie412/agent-coordinator",
+  "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Agent Coordinator",
+    "shortDescription": "Coordinate edits across Codex chats",
+    "category": "Productivity"
+  }
+}
