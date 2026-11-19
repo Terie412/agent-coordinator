@@ -8,6 +8,8 @@
   "interface": {
     "displayName": "Agent Coordinator",
     "shortDescription": "Coordinate edits across Codex chats",
-    "category": "Productivity"
+    "category": "Productivity",
+    "logo": "./assets/icon.svg",
+    "composerIcon": "./assets/icon.svg"
   }
 }
