@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const EXE: &str = env!("CARGO_BIN_EXE_agent-coordinator");
 static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -163,12 +163,27 @@ fn independent_processes_wait_and_acquire_as_a_group() {
         "acquire",
         json!({"owner":wait_id, "paths":["shared.txt"], "wait_seconds":3}),
     );
-    std::thread::sleep(std::time::Duration::from_millis(250));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        let status = holder.tool("status", json!({}));
+        if status["requests"][0].is_object() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Waiting request was never visible"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(status["requests"][0]["owner"], wait_id);
+    assert_eq!(status["requests"][0]["paths"], json!(["shared.txt"]));
+    assert_eq!(status["requests"][0]["blocking_locks"], json!([id]));
     assert_eq!(
         holder.tool("release", json!({"owner":hold_id, "lock_ids":[id]}))["released"],
         json!([id])
     );
     assert_eq!(waiter.receive()["structuredContent"]["acquired"], true);
+    assert_eq!(holder.tool("status", json!({}))["requests"], json!([]));
     assert_eq!(
         holder.tool("release", json!({"owner":hold_id, "lock_ids":[id]}))["already_absent"],
         json!([id])

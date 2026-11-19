@@ -1,6 +1,6 @@
 use crate::checkout::Checkout;
 use crate::{MAX_ITEMS, Result};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -72,6 +72,14 @@ impl Store {
             acquired_at INTEGER NOT NULL,
             ended_at INTEGER,
             UNIQUE (scope, key)
+        );
+        CREATE TABLE IF NOT EXISTS wait_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope TEXT NOT NULL,
+            paths TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            requested_at INTEGER NOT NULL,
+            expires_at_ms INTEGER NOT NULL
         )",
         )?;
         Ok(Self(connection))
@@ -105,14 +113,55 @@ impl Store {
             (_, None) => BTreeMap::from([(String::new(), String::new())]),
         };
         let deadline = Instant::now() + Duration::from_secs(wait);
-        loop {
-            let result = self.try_acquire(owner, scope, &paths)?;
+        let mut request_id = None;
+        let result = loop {
+            let result = match self.try_acquire(owner, scope, &paths, request_id) {
+                Ok(result) => result,
+                Err(error) => break Err(error),
+            };
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if result["acquired"] == true || remaining.is_zero() {
+            if result["acquired"] == true {
                 return Ok(result);
             }
-            thread::sleep(remaining.min(Duration::from_millis(200)));
+            if remaining.is_zero() {
+                break Ok(result);
+            }
+            if request_id.is_none() {
+                request_id = Some(self.register_wait(owner, scope, &paths, remaining)?);
+            }
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(200)),
+            );
+        };
+        if let Some(id) = request_id {
+            // The request expires even if cleanup fails or the process is terminated.
+            let _ = self
+                .0
+                .execute("DELETE FROM wait_requests WHERE id = ?", [id]);
         }
+        result
+    }
+
+    fn register_wait(
+        &self,
+        owner: &str,
+        scope: Scope,
+        paths: &BTreeMap<String, String>,
+        remaining: Duration,
+    ) -> Result<i64> {
+        let now = timestamp_ms()?;
+        self.0
+            .execute("DELETE FROM wait_requests WHERE expires_at_ms <= ?", [now])?;
+        let paths = serde_json::to_string(paths)?;
+        let expires_at = now + i64::try_from(remaining.as_millis())?;
+        Ok(self.0.query_row(
+            "INSERT INTO wait_requests (scope, paths, owner, requested_at, expires_at_ms)
+             VALUES (?, ?, ?, ?, ?) RETURNING id",
+            params![scope.name(), paths, owner, now / 1000, expires_at],
+            |row| row.get(0),
+        )?)
     }
 
     fn try_acquire(
@@ -120,6 +169,7 @@ impl Store {
         owner: &str,
         scope: Scope,
         paths: &BTreeMap<String, String>,
+        request_id: Option<i64>,
     ) -> Result<Value> {
         // BEGIN IMMEDIATE serializes the conflict check with the entire group insert.
         let transaction = self
@@ -128,15 +178,7 @@ impl Store {
         let locks = all_locks(&transaction)?;
         let conflicts: Vec<_> = locks
             .iter()
-            .filter(|lock| {
-                lock.owner != owner
-                    && (scope == Scope::Checkout
-                        || lock.scope == Scope::Checkout.name()
-                        || scope == Scope::Git && lock.scope == Scope::Git.name()
-                        || scope == Scope::Files
-                            && lock.scope == Scope::Files.name()
-                            && paths.keys().any(|key| paths_overlap(key, &lock.key)))
-            })
+            .filter(|lock| lock.blocks(owner, scope, paths))
             .collect();
         if !conflicts.is_empty() {
             return Ok(json!({"acquired": false, "conflicts": conflicts}));
@@ -170,12 +212,66 @@ impl Store {
                 ended_at: None,
             })?);
         }
+        if let Some(id) = request_id {
+            transaction.execute("DELETE FROM wait_requests WHERE id = ?", [id])?;
+        }
         transaction.commit()?;
         Ok(json!({"acquired": true, "locks": acquired}))
     }
 
-    pub fn status(&self, root: &Path) -> Result<Value> {
-        Ok(json!({"checkout": root, "locks": all_locks(&self.0)?}))
+    pub fn inspect(checkout: &Checkout) -> Result<Value> {
+        if !checkout.database.try_exists()? {
+            return Ok(json!({"checkout": checkout.root, "locks": [], "requests": []}));
+        }
+        let connection =
+            Connection::open_with_flags(&checkout.database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_millis(1500))?;
+        Self(connection).status(&checkout.root)
+    }
+
+    fn status(&self, root: &Path) -> Result<Value> {
+        let snapshot = self.0.unchecked_transaction()?;
+        let exists = |name| {
+            snapshot.query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?)",
+                [name],
+                |row| row.get::<_, bool>(0),
+            )
+        };
+        if !exists("locks")? {
+            return Ok(json!({"checkout": root, "locks": [], "requests": []}));
+        }
+        let locks = all_locks(&snapshot)?;
+        if !exists("wait_requests")? {
+            return Ok(json!({"checkout": root, "locks": locks, "requests": []}));
+        }
+        let mut statement = snapshot.prepare(
+            "SELECT id, scope, paths, owner, requested_at FROM wait_requests
+             WHERE expires_at_ms > ? ORDER BY id",
+        )?;
+        let mut rows = statement.query([timestamp_ms()?])?;
+        let mut requests = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let scope: Scope = row.get::<_, String>(1)?.parse()?;
+            let paths: BTreeMap<String, String> = serde_json::from_str(&row.get::<_, String>(2)?)?;
+            let owner: String = row.get(3)?;
+            let requested_at: i64 = row.get(4)?;
+            let blocking_locks: Vec<_> = locks
+                .iter()
+                .filter(|lock| lock.blocks(&owner, scope, &paths))
+                .map(|lock| lock.lock_id)
+                .collect();
+            requests.push(json!({
+                "request_id": id,
+                "scope": scope,
+                "paths": paths.values().filter(|path| !path.is_empty()).collect::<Vec<_>>(),
+                "owner": owner,
+                "requested_at": requested_at,
+                "blocking_locks": blocking_locks,
+            }));
+        }
+        Ok(json!({"checkout": root, "locks": locks, "requests": requests}))
     }
 
     pub fn missing(
@@ -242,6 +338,18 @@ impl Store {
     }
 }
 
+impl Lock {
+    fn blocks(&self, owner: &str, scope: Scope, paths: &BTreeMap<String, String>) -> bool {
+        self.owner != owner
+            && (scope == Scope::Checkout
+                || self.scope == Scope::Checkout.name()
+                || scope == Scope::Git && self.scope == Scope::Git.name()
+                || scope == Scope::Files
+                    && self.scope == Scope::Files.name()
+                    && paths.keys().any(|key| paths_overlap(key, &self.key)))
+    }
+}
+
 fn all_locks(connection: &Connection) -> Result<Vec<Lock>> {
     let mut statement = connection.prepare(
         "SELECT id, scope, key, path, owner, acquired_at, ended_at FROM locks ORDER BY id",
@@ -267,9 +375,13 @@ fn paths_overlap(a: &str, b: &str) -> bool {
 }
 
 fn timestamp() -> Result<i64> {
+    Ok(timestamp_ms()? / 1000)
+}
+
+fn timestamp_ms() -> Result<i64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)?
-        .as_secs()
+        .as_millis()
         .try_into()?)
 }
 

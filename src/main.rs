@@ -69,9 +69,7 @@ fn run() -> Result<ExitCode> {
         ("status", []) => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(
-                    &Store::open(&checkout.database)?.status(&checkout.root)?
-                )?
+                serde_json::to_string_pretty(&Store::inspect(&checkout)?)?
             );
             Ok(())
         }

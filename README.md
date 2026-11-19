@@ -30,6 +30,10 @@ codex plugin add agent-coordinator@agent-coordinator-local
 
 启用后，Codex 会在补丁编辑和常见 Git 写操作前检查锁。提交只带当前聊天负责的文件。脚本和外部编辑器也需要主动协调写入。
 
+## 查看锁和等待请求
+
+用安装包 `plugins/agent-coordinator/bin/` 下的可执行文件运行 `agent-coordinator status "<仓库路径>"`，查看持锁会话、等待中的请求和阻塞它们的锁。
+
 ## 恢复遗留锁
 
-用插件包 `plugins/agent-coordinator/bin/` 下的可执行文件运行 `agent-coordinator status <仓库路径>`。确认旧任务已停止且遗留改动已处理后，用 `agent-coordinator recover <仓库路径> <会话ID> <锁ID>` 释放对应的锁。
+用 `status` 找到会话 ID 和锁 ID。确认旧任务已停止且遗留改动已处理后，用 `agent-coordinator recover <仓库路径> <会话ID> <锁ID>` 释放对应的锁。

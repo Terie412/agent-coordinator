@@ -152,11 +152,10 @@ fn call(fixed: Option<&Checkout>, name: &str, mut args: Value) -> Result<Value> 
         routed = Checkout::find(root)?;
         &routed
     };
-    let mut store = Store::open(&checkout.database)?;
     match name {
         "acquire" => {
             let args: Acquire = serde_json::from_value(args)?;
-            store.acquire(
+            Store::open(&checkout.database)?.acquire(
                 checkout,
                 args.owner.as_deref().unwrap_or_default(),
                 args.scope,
@@ -165,18 +164,19 @@ fn call(fixed: Option<&Checkout>, name: &str, mut args: Value) -> Result<Value> 
             )
         }
         "status" if args.as_object().is_some_and(|args| args.is_empty()) => {
-            store.status(&checkout.root)
+            Store::inspect(checkout)
         }
         "status" => Err("status does not take arguments".into()),
         "new_session"
             if fixed.is_some() && args.as_object().is_some_and(|args| args.is_empty()) =>
         {
-            store.new_session()
+            Store::open(&checkout.database)?.new_session()
         }
         "new_session" => Err("new_session does not take arguments".into()),
         "release" => {
             let args: Release = serde_json::from_value(args)?;
-            store.release(args.owner.as_deref().unwrap_or_default(), &args.lock_ids)
+            Store::open(&checkout.database)?
+                .release(args.owner.as_deref().unwrap_or_default(), &args.lock_ids)
         }
         _ => Err("Unknown tool".into()),
     }
@@ -192,7 +192,7 @@ fn tools(plugin: bool) -> Vec<Value> {
                 "paths":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":MAX_ITEMS},
                 "wait_seconds":{"type":"integer","minimum":0,"maximum":MAX_WAIT,"default":0}
             }}}),
-        json!({"name":"status", "description":"View held locks, session IDs, and pending recovery (ended_at).",
+        json!({"name":"status", "description":"View held locks, waiting requests and their blockers, and pending recovery (ended_at).",
             "inputSchema":{"type":"object","properties":{},"additionalProperties":false},
             "annotations":{"readOnlyHint":true}}),
         json!({"name":"release", "description":"Release your exact lock IDs after commit or a safe handoff. Missing IDs are reported as already absent.",
