@@ -398,6 +398,27 @@ fn hook_checks_rename_paths_and_identity_and_preserves_ended_locks() {
 }
 
 #[test]
+fn read_only_shell_command_skips_git_metadata_lookup() {
+    let root = repo();
+    let nested = root.join("broken-checkout");
+    fs::create_dir(&nested).unwrap();
+    fs::write(nested.join(".git"), "invalid git metadata").unwrap();
+
+    let git = |command| {
+        run_hook(
+            &nested,
+            &[],
+            "PreToolUse",
+            "session",
+            "Bash",
+            json!({"command":command}),
+        )
+    };
+    assert!(git("git status --short").is_null());
+    assert_eq!(git("git switch main")["permissionDecision"], "deny");
+}
+
+#[test]
 fn git_lock_serializes_index_operations_and_checkout_lock_excludes_other_owners() {
     let root = repo();
     let mut one = Client::start(&root);

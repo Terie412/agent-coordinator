@@ -114,6 +114,8 @@ impl Store {
         };
         let deadline = Instant::now() + Duration::from_secs(wait);
         let mut request_id = None;
+        let max_retry_delay = Duration::from_millis(200);
+        let mut retry_delay = Duration::from_millis(25);
         let result = loop {
             let result = match self.try_acquire(owner, scope, &paths, request_id) {
                 Ok(result) => result,
@@ -132,8 +134,9 @@ impl Store {
             thread::sleep(
                 deadline
                     .saturating_duration_since(Instant::now())
-                    .min(Duration::from_millis(200)),
+                    .min(retry_delay),
             );
+            retry_delay = (retry_delay * 2).min(max_retry_delay);
         };
         if let Some(id) = request_id {
             // The request expires even if cleanup fails or the process is terminated.
@@ -171,17 +174,20 @@ impl Store {
         paths: &BTreeMap<String, String>,
         request_id: Option<i64>,
     ) -> Result<Value> {
+        // Poll a blocked request without reserving SQLite's writer slot. Recheck under
+        // the write transaction before granting so another session cannot race the probe.
+        if request_id.is_some()
+            && let Some(result) = blocked(&all_locks(&self.0)?, owner, scope, paths)
+        {
+            return Ok(result);
+        }
         // BEGIN IMMEDIATE serializes the conflict check with the entire group insert.
         let transaction = self
             .0
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let locks = all_locks(&transaction)?;
-        let conflicts: Vec<_> = locks
-            .iter()
-            .filter(|lock| lock.blocks(owner, scope, paths))
-            .collect();
-        if !conflicts.is_empty() {
-            return Ok(json!({"acquired": false, "conflicts": conflicts}));
+        if let Some(result) = blocked(&locks, owner, scope, paths) {
+            return Ok(result);
         }
 
         let now = timestamp()?;
@@ -348,6 +354,19 @@ impl Lock {
                     && self.scope == Scope::Files.name()
                     && paths.keys().any(|key| paths_overlap(key, &self.key)))
     }
+}
+
+fn blocked(
+    locks: &[Lock],
+    owner: &str,
+    scope: Scope,
+    paths: &BTreeMap<String, String>,
+) -> Option<Value> {
+    let conflicts: Vec<_> = locks
+        .iter()
+        .filter(|lock| lock.blocks(owner, scope, paths))
+        .collect();
+    (!conflicts.is_empty()).then(|| json!({"acquired": false, "conflicts": conflicts}))
 }
 
 fn all_locks(connection: &Connection) -> Result<Vec<Lock>> {

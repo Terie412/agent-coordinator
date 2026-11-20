@@ -105,6 +105,17 @@ pub fn hook(fixed: Option<&Checkout>) -> Result<()> {
 }
 
 fn hook_result(fixed: Option<&Checkout>, input: &Value, event: &str) -> Result<Option<Value>> {
+    let git_lock = if event == "PreToolUse" && input["tool_name"] == "Bash" {
+        let command = input["tool_input"]["command"]
+            .as_str()
+            .ok_or("Missing command")?;
+        let Some(scope) = git_scope(command) else {
+            return Ok(None);
+        };
+        Some(scope)
+    } else {
+        None
+    };
     let local;
     let checkout = if let Some(checkout) = fixed {
         checkout
@@ -129,7 +140,7 @@ fn hook_result(fixed: Option<&Checkout>, input: &Value, event: &str) -> Result<O
             }
             None
         }
-        "PreToolUse" => pre_tool_use(checkout, input, fixed.is_none())?,
+        "PreToolUse" => pre_tool_use(checkout, input, fixed.is_none(), git_lock)?,
         _ => None,
     })
 }
@@ -138,7 +149,12 @@ fn session(input: &Value) -> Result<&str> {
     validate_owner(input["session_id"].as_str().unwrap_or_default())
 }
 
-fn pre_tool_use(checkout: &Checkout, input: &Value, plugin: bool) -> Result<Option<Value>> {
+fn pre_tool_use(
+    checkout: &Checkout,
+    input: &Value,
+    plugin: bool,
+    git_lock: Option<Scope>,
+) -> Result<Option<Value>> {
     let tool = input["tool_name"].as_str().ok_or("Missing tool_name")?;
     let arguments = &input["tool_input"];
     let action = tool.strip_prefix(PREFIX);
@@ -158,9 +174,10 @@ fn pre_tool_use(checkout: &Checkout, input: &Value, plugin: bool) -> Result<Opti
         }})));
     }
 
-    let command = arguments["command"].as_str().ok_or("Missing command")?;
-    let (scope, paths) = match tool {
-        "apply_patch" => {
+    let (scope, paths) = match git_lock {
+        Some(scope) => (scope, BTreeMap::new()),
+        None if tool == "apply_patch" => {
+            let command = arguments["command"].as_str().ok_or("Missing command")?;
             let cwd = arguments["workdir"]
                 .as_str()
                 .or_else(|| input["cwd"].as_str())
@@ -170,13 +187,7 @@ fn pre_tool_use(checkout: &Checkout, input: &Value, plugin: bool) -> Result<Opti
                 checkout.files(&patch_files(command)?, Path::new(cwd))?,
             )
         }
-        "Bash" => {
-            let Some(scope) = git_scope(command) else {
-                return Ok(None);
-            };
-            (scope, BTreeMap::new())
-        }
-        _ => return Ok(None),
+        None => return Ok(None),
     };
     let missing = Store::open(&checkout.database)?.missing(session(input)?, scope, &paths)?;
     Ok((!missing.is_empty()).then(|| {
